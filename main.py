@@ -4,25 +4,24 @@ import numpy as np
 import os
 import gc
 
-app = FastAPI(title="Akıllı Ürün Tanıma - DENGELİ MOD V7")
+app = FastAPI(title="Akıllı Ürün Tanıma - REKABET MODU V8")
 
 KLASOR = "urunler"
 
 def goruntu_islee_ve_bul(gelen_resim_bytes):
-    # 1. RESMİ OKU
     nparr = np.frombuffer(gelen_resim_bytes, np.uint8)
     aranan_resim = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if aranan_resim is None: return None, 0
 
-    # Çözünürlük (Detayları kaybetmemek için 1000 iyi bir standart)
+    # Çözünürlük 1000px
     yukseklik, genislik = aranan_resim.shape[:2]
     if genislik > 1000:
         oran = 1000 / genislik
         yeni_yukseklik = int(yukseklik * oran)
         aranan_resim = cv2.resize(aranan_resim, (1000, yeni_yukseklik))
 
-    # Griye Çevir + Kontrast Artır (CLAHE)
+    # Gri + Kontrast
     img_gray = cv2.cvtColor(aranan_resim, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
     img_gray = clahe.apply(img_gray)
@@ -32,8 +31,8 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
     
     if des1 is None: return None, 0
 
-    en_yuksek_skor = 0
-    bulunan_kod = "Bulunamadı"
+    # --- DEĞİŞİKLİK BURADA: Sadece en iyiyi değil, TÜM adayları topluyoruz ---
+    tum_adaylar = [] # Örnek: [('1704.jpg', 55), ('1705.jpg', 50)]
 
     if not os.path.exists(KLASOR): return "VeritabaniYok", 0
     
@@ -44,10 +43,9 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
         
         try:
             db_path = os.path.join(KLASOR, dosya)
-            db_img = cv2.imread(db_path, cv2.IMREAD_GRAYSCALE) # Gri okumak yeterli
+            db_img = cv2.imread(db_path, cv2.IMREAD_GRAYSCALE)
             if db_img is None: continue
 
-            # Veritabanı resmini boyutlandır
             h, w = db_img.shape[:2]
             if w > 1000:
                 scale = 1000 / w
@@ -58,7 +56,6 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
             kp2, des2 = sift.detectAndCompute(db_img, None)
             
             if des2 is not None and len(des2) > 10:
-                # Eşleştirme
                 index_params = dict(algorithm=1, trees=5)
                 search_params = dict(checks=50)
                 flann = cv2.FlannBasedMatcher(index_params, search_params)
@@ -66,57 +63,71 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
                 
                 iyi_eslesmeler = []
                 for m, n in matches:
-                    # --- DÜZELTME 1: ORAN TESTİ ---
-                    # 0.60 çok katıydı, hiçbir şeyi beğenmiyordu.
-                    # 0.70 endüstri standardıdır. Işık farkını tolere eder.
-                    if m.distance < 0.70 * n.distance:
+                    if m.distance < 0.7 * n.distance:
                         iyi_eslesmeler.append(m)
                 
-                # --- DÜZELTME 2: MİNİMUM NOKTA SAYISI ---
-                # 25 nokta bulmak zordur. 12 nokta "Geometrik olarak"
-                # kusursuz hizalanıyorsa, o ürün o üründür.
-                if len(iyi_eslesmeler) >= 12:
+                if len(iyi_eslesmeler) >= 10:
                     src_pts = np.float32([kp1[m.queryIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     dst_pts = np.float32([kp2[m.trainIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     
-                    # Geometri Doğrulama (RANSAC)
-                    # Yanlış ürünleri eleyen ASIL KAHRAMAN budur.
                     M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
                     
                     if mask is not None:
-                        # Geometriye uyan nokta sayısı
                         skor = sum(mask.ravel().tolist())
-                        
-                        # Eğer geometriye uyan nokta sayısı, toplam iyi noktalara oranla çok düşükse
-                        # (Örn: 100 nokta buldum ama sadece 5'i hizalı) bu yanlıştır.
-                        # Ama biz basit skor takibi yapalım:
-                        if skor > en_yuksek_skor:
-                            en_yuksek_skor = skor
-                            bulunan_kod = dosya.split(".")[0]
+                        # Skoru listeye ekle (Skor, DosyaAdi)
+                        tum_adaylar.append((skor, dosya.split(".")[0]))
 
             del db_img, kp2, des2
         except:
             pass
 
     gc.collect()
-    return bulunan_kod, en_yuksek_skor
+
+    # --- REKABET ANALİZİ ---
+    if not tum_adaylar:
+        return "Bulunamadı", 0
+    
+    # Skorlara göre büyükten küçüğe sırala
+    tum_adaylar.sort(key=lambda x: x[0], reverse=True)
+    
+    en_iyi_skor = tum_adaylar[0][0]
+    en_iyi_kod = tum_adaylar[0][1]
+    
+    # Eğer sadece 1 tane aday varsa ve skoru iyiyse döndür
+    if len(tum_adaylar) == 1:
+        return en_iyi_kod, en_iyi_skor
+
+    # Eğer birden fazla aday varsa, 1. ile 2. arasındaki farka bak
+    ikinci_en_iyi_skor = tum_adaylar[1][0]
+    
+    # KURAL: Birinci, ikinciden en az %20 daha iyi olmalı.
+    # Değilse (puanlar yakınsa), sistem yanılıyordur. Reddet.
+    fark_orani = en_iyi_skor / (ikinci_en_iyi_skor + 0.1) # 0'a bölünme hatası olmasın
+    
+    if fark_orani < 1.2: # %20 fark yoksa
+        # "Kararsızım" mesajı döndür (Kod yerine None dönebiliriz veya özel mesaj)
+        print(f"KARARSIZLIK: {en_iyi_kod} ({en_iyi_skor}) vs {tum_adaylar[1][1]} ({ikinci_en_iyi_skor})")
+        return "Kararsiz", en_iyi_skor # Yanlış kod vermemek için özel durum
+        
+    return en_iyi_kod, en_iyi_skor
 
 @app.get("/")
 def ana_sayfa():
-    return {"durum": "aktif", "mod": "DENGELİ MOD (V7)"}
+    return {"durum": "aktif", "mod": "REKABET MODU (Anti-Karışıklık)"}
 
 @app.post("/tara")
 async def urun_tara(file: UploadFile = File(...)):
     resim_verisi = await file.read()
     kod, skor = goruntu_islee_ve_bul(resim_verisi)
     
-    # --- FİNAL KARAR ---
-    # 12 tane "Geometrik Olarak Kusursuz" nokta varsa kabul et.
-    # Rastgele ürünlerde bu sayı genelde 4-5 çıkar.
-    # Doğru ürünlerde 15-50 arası çıkar.
-    LIMIT = 12
+    # "Kararsiz" döndüyse kullanıcıya dürüst olalım
+    if kod == "Kararsiz":
+         return {"sonuc": False, "urun_kodu": None, "guven_skoru": skor, "mesaj": "Çok benzer ürünler var, netleyip tekrar çekin."}
+
+    # Normal Baraj
+    LIMIT = 15
     
-    if skor >= LIMIT:
+    if skor >= LIMIT and kod != "Bulunamadı":
         return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "mesaj": "Bulundu"}
     else:
         mesaj = f"Yetersiz Veri ({skor})"
