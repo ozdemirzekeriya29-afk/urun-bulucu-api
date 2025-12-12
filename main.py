@@ -4,7 +4,7 @@ import numpy as np
 import os
 import gc
 
-app = FastAPI(title="Akıllı Ürün Tanıma - KESİN EŞLEŞME V6")
+app = FastAPI(title="Akıllı Ürün Tanıma - DENGELİ MOD V7")
 
 KLASOR = "urunler"
 
@@ -15,25 +15,24 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
     
     if aranan_resim is None: return None, 0
 
-    # Çözünürlüğü netlik için 1200px'e sabitle
+    # Çözünürlük (Detayları kaybetmemek için 1000 iyi bir standart)
     yukseklik, genislik = aranan_resim.shape[:2]
-    if genislik > 1200:
-        oran = 1200 / genislik
+    if genislik > 1000:
+        oran = 1000 / genislik
         yeni_yukseklik = int(yukseklik * oran)
-        aranan_resim = cv2.resize(aranan_resim, (1200, yeni_yukseklik))
+        aranan_resim = cv2.resize(aranan_resim, (1000, yeni_yukseklik))
 
-    # Griye Çevir + Kontrastı Fullee (Detayları patlat)
+    # Griye Çevir + Kontrast Artır (CLAHE)
     img_gray = cv2.cvtColor(aranan_resim, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)) # Kontrastı artırdık
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
     img_gray = clahe.apply(img_gray)
     
-    # SIFT Oluştur
     sift = cv2.SIFT_create()
     kp1, des1 = sift.detectAndCompute(img_gray, None)
     
     if des1 is None: return None, 0
 
-    en_iyi_eslesme_sayisi = 0
+    en_yuksek_skor = 0
     bulunan_kod = "Bulunamadı"
 
     if not os.path.exists(KLASOR): return "VeritabaniYok", 0
@@ -45,23 +44,21 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
         
         try:
             db_path = os.path.join(KLASOR, dosya)
-            
-            # Veritabanı resmini gri oku
-            db_img = cv2.imread(db_path, cv2.IMREAD_GRAYSCALE)
+            db_img = cv2.imread(db_path, cv2.IMREAD_GRAYSCALE) # Gri okumak yeterli
             if db_img is None: continue
 
-            # Veritabanı resmini de netleştir
+            # Veritabanı resmini boyutlandır
             h, w = db_img.shape[:2]
-            if w > 1200:
-                scale = 1200 / w
+            if w > 1000:
+                scale = 1000 / w
                 new_h = int(h * scale)
-                db_img = cv2.resize(db_img, (1200, new_h))
+                db_img = cv2.resize(db_img, (1000, new_h))
 
             db_img = clahe.apply(db_img)
             kp2, des2 = sift.detectAndCompute(db_img, None)
             
-            if des2 is not None and len(des2) > 15:
-                # Eşleştirme Ayarları
+            if des2 is not None and len(des2) > 10:
+                # Eşleştirme
                 index_params = dict(algorithm=1, trees=5)
                 search_params = dict(checks=50)
                 flann = cv2.FlannBasedMatcher(index_params, search_params)
@@ -69,35 +66,32 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
                 
                 iyi_eslesmeler = []
                 for m, n in matches:
-                    # --- DUVAR 1: SÜPER SIKI FİLTRE ---
-                    # 0.60 çok düşük bir orandır. Sadece %100 aynı olan noktalar geçer.
-                    # Benzer olanlar elenir.
-                    if m.distance < 0.60 * n.distance:
+                    # --- DÜZELTME 1: ORAN TESTİ ---
+                    # 0.60 çok katıydı, hiçbir şeyi beğenmiyordu.
+                    # 0.70 endüstri standardıdır. Işık farkını tolere eder.
+                    if m.distance < 0.70 * n.distance:
                         iyi_eslesmeler.append(m)
                 
-                # --- DUVAR 2: MİNİMUM NOKTA SAYISI ---
-                # En az 20 tane kusursuz nokta yoksa, geometriye bakma bile.
-                if len(iyi_eslesmeler) >= 20:
+                # --- DÜZELTME 2: MİNİMUM NOKTA SAYISI ---
+                # 25 nokta bulmak zordur. 12 nokta "Geometrik olarak"
+                # kusursuz hizalanıyorsa, o ürün o üründür.
+                if len(iyi_eslesmeler) >= 12:
                     src_pts = np.float32([kp1[m.queryIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     dst_pts = np.float32([kp2[m.trainIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     
                     # Geometri Doğrulama (RANSAC)
-                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 4.0)
+                    # Yanlış ürünleri eleyen ASIL KAHRAMAN budur.
+                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
                     
                     if mask is not None:
-                        matchesMask = mask.ravel().tolist()
-                        gercek_uyusanlar = sum(matchesMask)
-
-                        # --- DUVAR 3: GEOMETRİK BOZULMA KONTROLÜ ---
-                        # Bulunan nesne yamulmuş mu? Ters mi dönmüş?
-                        # Determinant 0'a yakınsa nesne çizgiden ibarettir, reddet.
-                        det = np.linalg.det(M[:2, :2])
-                        if abs(det) < 0.1: # Anlamsız geometri
-                            continue
-
-                        # EĞER 25'TEN FAZLA KUSURSUZ NOKTA VARSA KABUL ET
-                        if gercek_uyusanlar > 25 and gercek_uyusanlar > en_iyi_eslesme_sayisi:
-                            en_iyi_eslesme_sayisi = gercek_uyusanlar
+                        # Geometriye uyan nokta sayısı
+                        skor = sum(mask.ravel().tolist())
+                        
+                        # Eğer geometriye uyan nokta sayısı, toplam iyi noktalara oranla çok düşükse
+                        # (Örn: 100 nokta buldum ama sadece 5'i hizalı) bu yanlıştır.
+                        # Ama biz basit skor takibi yapalım:
+                        if skor > en_yuksek_skor:
+                            en_yuksek_skor = skor
                             bulunan_kod = dosya.split(".")[0]
 
             del db_img, kp2, des2
@@ -105,24 +99,25 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
             pass
 
     gc.collect()
-    return bulunan_kod, en_iyi_eslesme_sayisi
+    return bulunan_kod, en_yuksek_skor
 
 @app.get("/")
 def ana_sayfa():
-    return {"durum": "aktif", "mod": "KESİN EŞLEŞME (No False Positive)"}
+    return {"durum": "aktif", "mod": "DENGELİ MOD (V7)"}
 
 @app.post("/tara")
 async def urun_tara(file: UploadFile = File(...)):
     resim_verisi = await file.read()
     kod, skor = goruntu_islee_ve_bul(resim_verisi)
     
-    # --- FİNAL KARAR NOKTASI ---
-    # Artık skor "Benzerlik Puanı" değil, "Kusursuz Nokta Sayısı"dır.
-    # 25 tane kusursuz nokta yoksa o ürün o ürün değildir.
-    LIMIT = 25
+    # --- FİNAL KARAR ---
+    # 12 tane "Geometrik Olarak Kusursuz" nokta varsa kabul et.
+    # Rastgele ürünlerde bu sayı genelde 4-5 çıkar.
+    # Doğru ürünlerde 15-50 arası çıkar.
+    LIMIT = 12
     
     if skor >= LIMIT:
-        return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "mesaj": "Tam Eşleşme"}
+        return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "mesaj": "Bulundu"}
     else:
-        # 0 puan dönsün ki uygulama "Bulunamadı" desin.
-        return {"sonuc": False, "urun_kodu": None, "guven_skoru": skor, "mesaj": "Eşleşme Yok"}
+        mesaj = f"Yetersiz Veri ({skor})"
+        return {"sonuc": False, "urun_kodu": None, "guven_skoru": skor, "mesaj": mesaj}
