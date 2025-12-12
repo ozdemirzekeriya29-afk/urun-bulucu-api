@@ -4,29 +4,30 @@ import numpy as np
 import os
 import gc
 
-app = FastAPI(title="Akıllı Ürün Tanıma Servisi - Sıkı Mod")
+app = FastAPI(title="Akıllı Ürün Tanıma - Final V4")
 
 KLASOR = "urunler"
 
 def goruntu_islee_ve_bul(gelen_resim_bytes):
-    # Gelen resmi oku
+    # Resmi Oku
     nparr = np.frombuffer(gelen_resim_bytes, np.uint8)
     aranan_resim = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if aranan_resim is None: return None, 0
 
-    # Çözünürlüğü biraz daha net tutuyoruz (Detayları görebilsin diye)
+    # Çözünürlüğü makul seviyeye çek (1000px)
     yukseklik, genislik = aranan_resim.shape[:2]
     if genislik > 1000:
         oran = 1000 / genislik
         yeni_yukseklik = int(yukseklik * oran)
         aranan_resim = cv2.resize(aranan_resim, (1000, yeni_yukseklik))
 
-    # Gri Tonlama + Kontrast Eşitleme (CLAHE)
+    # Griye Çevir + CLAHE (Kontrast Artırma)
     img1 = cv2.cvtColor(aranan_resim, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     img1 = clahe.apply(img1)
     
+    # SIFT Algoritması
     sift = cv2.SIFT_create()
     kp1, des1 = sift.detectAndCompute(img1, None)
     
@@ -58,8 +59,8 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
             db_img = clahe.apply(db_img)
             kp2, des2 = sift.detectAndCompute(db_img, None)
             
-            if des2 is not None and len(des2) > 5:
-                # FLANN Parametreleri
+            if des2 is not None and len(des2) > 10:
+                # FLANN Eşleştirici
                 index_params = dict(algorithm=1, trees=5)
                 search_params = dict(checks=50)
                 flann = cv2.FlannBasedMatcher(index_params, search_params)
@@ -67,29 +68,29 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
                 
                 iyi_eslesmeler = []
                 for m, n in matches:
-                    # --- KRİTİK AYAR 1: SIKI EŞLEŞME ---
-                    # 0.75 yerine 0.65 yaptık. Sadece "Çok benzeyen" noktaları alır.
-                    if m.distance < 0.65 * n.distance:
+                    # Oran Testi: 0.7 (Ne çok sıkı ne çok gevşek)
+                    if m.distance < 0.7 * n.distance:
                         iyi_eslesmeler.append(m)
                 
-                # --- KRİTİK AYAR 2: MİNİMUM NOKTA SAYISI ---
-                # En az 8 nokta tutmazsa hiç geometri kontrolü yapma.
-                if len(iyi_eslesmeler) >= 8:
+                # --- İLK ELEME: Nokta Sayısı ---
+                # Eğer en az 12 tane çok iyi nokta bulamadıysa, 
+                # bu resim o resim değildir. Hiç geometriye girme.
+                if len(iyi_eslesmeler) >= 12:
                     src_pts = np.float32([kp1[m.queryIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     dst_pts = np.float32([kp2[m.trainIdx].pt for m in iyi_eslesmeler]).reshape(-1, 1, 2)
                     
-                    # RANSAC ile geometriyi doğrula
-                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    # RANSAC Eşik Değeri: 4.0 (Noktaların ne kadar hizalı olması gerektiği)
+                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 4.0)
                     
                     if mask is not None:
-                        # Maske içindeki başarılı nokta sayısı
+                        # Sadece geometriye uyan noktaları say (Gerçek Skor)
                         skor = sum(mask.ravel().tolist())
                         
                         if skor > en_yuksek_skor:
                             en_yuksek_skor = skor
                             bulunan_kod = dosya.split(".")[0]
 
-            del db_img, kp2, des2 # Hafıza Temizliği
+            del db_img, kp2, des2
         except:
             pass
 
@@ -98,21 +99,25 @@ def goruntu_islee_ve_bul(gelen_resim_bytes):
 
 @app.get("/")
 def ana_sayfa():
-    return {"durum": "aktif", "mesaj": "Sunucu SIKI MODDA Calisiyor"}
+    return {"durum": "aktif", "mesaj": "Sunucu V4 - Eşik 35"}
 
 @app.post("/tara")
 async def urun_tara(file: UploadFile = File(...)):
     resim_verisi = await file.read()
     kod, skor = goruntu_islee_ve_bul(resim_verisi)
     
-    # --- KRİTİK AYAR 3: FİNAL EŞİK DEĞERİ ---
-    # Bu değeri 15'e çıkardık.
-    # Eğer skor 15'ten azsa "Bulunamadı" de.
-    # Rastgele ürünler genelde 4-8 arası puan alır, elenirler.
-    ESIK = 15
+    # --- FİNAL BARAJI: 35 PUAN ---
+    # Gerçek ürünler genelde 50-100 arası alır.
+    # Rastgele ürünler 10-20 arası alır.
+    ESIK = 35 
     
     if skor >= ESIK:
         return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "mesaj": "Bulundu"}
     else:
-        mesaj = f"Yetersiz Benzerlik ({skor})"
+        # Kullanıcıya skoru gösterelim ki neden bulamadığını anlasın
+        if skor > 0:
+            mesaj = f"Benzerlik Yetersiz (Skor: {skor}, Gereken: {ESIK})"
+        else:
+            mesaj = "Eşleşme Yok"
+            
         return {"sonuc": False, "urun_kodu": None, "guven_skoru": skor, "mesaj": mesaj}
