@@ -155,3 +155,4 @@ async def urun_tara(file: UploadFile = File(...)):
         return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "urun_detay": detaylar}
     else:
         return {"sonuc": False, "mesaj": "Eşleşme Yok"}
+        
