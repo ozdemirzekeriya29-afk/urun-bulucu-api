@@ -6,153 +6,173 @@ import gc
 import json
 import easyocr
 
-app = FastAPI(title="Akıllı Ürün Tanıma - OTO KIRPMA V13")
+app = FastAPI(title="Akıllı Ürün Tanıma - GÖRSEL + YAZI (HİBRİT)")
 
 KLASOR = "urunler"
 JSON_DOSYASI = "urunler.json"
+
+# OCR Motoru (GPU yoksa cpu modunda çalışır)
 reader = easyocr.Reader(['tr', 'en'], gpu=False) 
 
-# --- SİHİRLİ FONKSİYON: OTOMATİK NESNE KIRPMA ---
-def akilli_nesne_bul(img):
-    """
-    Fotoğraftaki en belirgin nesneyi (kutuyu) bulur ve kırpar.
-    Google Lens efekti için arka planı temizler.
-    """
-    try:
-        # Griye çevir ve bulanıklaştır (Gürültüyü sil)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Kenarları bul (Canny Edge Detection)
-        edges = cv2.Canny(blurred, 50, 150)
-        
-        # Konturları (Çizgileri) bul
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours: return img # Hiçbir şey bulamazsa orijinali döndür
-        
-        # En büyük alanı kaplayan konturu bul (Muhtemelen ürün odur)
-        c = max(contours, key=cv2.contourArea)
-        
-        # Dikdörtgen içine al
-        x, y, w, h = cv2.boundingRect(c)
-        
-        # Eğer bulunan parça çok küçükse (Leke falansa) kırpma, orijinal kalsın
-        h_img, w_img = img.shape[:2]
-        if w * h < (w_img * h_img) * 0.10: # Resmin %10'undan küçükse yoksay
-            return img
-            
-        # Kırpma işlemi (Biraz pay bırakarak - Padding)
-        pad = 20
-        x = max(0, x - pad)
-        y = max(0, y - pad)
-        w = min(w_img - x, w + pad*2)
-        h = min(h_img - y, h + pad*2)
-        
-        kirpilmis = img[y:y+h, x:x+w]
-        return kirpilmis
-    except:
-        return img # Hata olursa orijinali döndür
-
-# --- STANDART FONKSİYONLAR ---
-def urun_veritabani_yukle():
+# --- YARDIMCI: Veritabanı Yükle ---
+def veritabani_yukle():
     if not os.path.exists(JSON_DOSYASI): return {}
     with open(JSON_DOSYASI, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def urun_bilgisi_getir(kod):
-    if not os.path.exists(JSON_DOSYASI): return {"ad": kod, "fiyat": "?", "etiketler": []}
-    with open(JSON_DOSYASI, "r", encoding="utf-8") as f:
-        veri = json.load(f)
-    return veri.get(kod, {"ad": kod, "fiyat": "?", "etiketler": []})
+# --- MOTOR 1: GÖRSEL ANALİZ (AKAZE) ---
+def gorsel_puan_hesapla(aranan_resim, veritabani_klasor):
+    """
+    Resmin şekline bakar ve görsel benzerlik puanı verir.
+    """
+    img_gray = cv2.cvtColor(aranan_resim, cv2.COLOR_BGR2GRAY)
+    akaze = cv2.AKAZE_create(threshold=0.001)
+    kp1, des1 = akaze.detectAndCompute(img_gray, None)
+    
+    if des1 is None: return {}
 
-def metin_ile_bul(okunan_metinler, veritabani):
-    okunanlar = [kelime.lower() for kelime in okunan_metinler]
-    en_iyi_kod = None
-    en_cok_eslesme = 0
-    for kod, detay in veritabani.items():
-        etiketler = detay.get("etiketler", [])
-        eslesme = 0
-        for etiket in etiketler:
-            for okunan in okunanlar:
-                if etiket in okunan: eslesme += 1
-        if eslesme > en_cok_eslesme:
-            en_cok_eslesme = eslesme
-            en_iyi_kod = kod
-    if en_cok_eslesme >= 1: return en_iyi_kod, 100
-    return None, 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    gorsel_skorlar = {} # { "1704": 25, "1705": 10 }
 
-# --- ANA MOTOR ---
-def goruntu_islee_ve_bul(gelen_resim_bytes):
-    veritabani = urun_veritabani_yukle()
+    if not os.path.exists(veritabani_klasor): return {}
+
+    for dosya in os.listdir(veritabani_klasor):
+        if not dosya.endswith((".jpg", ".png")): continue
+        try:
+            # Dosya adından kodu al (1704_on.jpg -> 1704)
+            kod = dosya.split("_")[0].split(".")[0]
+            
+            path = os.path.join(veritabani_klasor, dosya)
+            db_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            
+            # Hız için küçült
+            h, w = db_img.shape[:2]
+            if w > 600:
+                s = 600/w
+                db_img = cv2.resize(db_img, (600, int(h*s)))
+
+            kp2, des2 = akaze.detectAndCompute(db_img, None)
+            
+            if des2 is not None and len(des2) > 10:
+                matches = bf.match(des1, des2)
+                iyi_eslesmeler = [m for m in matches if m.distance < 60]
+                skor = len(iyi_eslesmeler)
+                
+                # Eğer bu kod için daha önce düşük skor varsa güncelle
+                if skor > gorsel_skorlar.get(kod, 0):
+                    gorsel_skorlar[kod] = skor
+        except: pass
+        
+    return gorsel_skorlar
+
+# --- MOTOR 2: YAZI ANALİZİ (OCR) ---
+def yazi_puan_hesapla(resim, veritabani_json):
+    """
+    Resimdeki yazıları okur ve anahtar kelimelerle eşleştirir.
+    """
+    try:
+        # EasyOCR ile oku (Liste döner: ['ARBELLA', 'Burgu', '500g'])
+        okunan_yazilar = reader.readtext(resim, detail=0)
+        # Hepsini küçük harfe çevir
+        okunanlar = [yazi.lower() for yazi in okunan_yazilar]
+        
+        yazi_skorlar = {} # { "1704": 2, "1705": 1 }
+
+        for kod, detay in veritabani_json.items():
+            anahtar_kelimeler = detay.get("anahtar_kelimeler", [])
+            eslesme_sayisi = 0
+            
+            for anahtar in anahtar_kelimeler:
+                # Okunan metinlerin içinde anahtar kelime geçiyor mu?
+                # Örn: "arbella" kelimesi "arbella makarna" içinde var mı?
+                for okunan in okunanlar:
+                    if anahtar in okunan:
+                        eslesme_sayisi += 1
+                        break # Aynı kelimeyi 2 kere sayma
+            
+            yazi_skorlar[kod] = eslesme_sayisi
+            
+        return yazi_skorlar, okunan_yazilar
+    except:
+        return {}, []
+
+# --- ANA MERKEZ ---
+def analiz_et(gelen_resim_bytes):
+    veritabani_json = veritabani_yukle()
+    
     nparr = np.frombuffer(gelen_resim_bytes, np.uint8)
-    orijinal_resim = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if orijinal_resim is None: return None, 0, "Hata"
+    resim = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if resim is None: return None, 0, {}
 
-    # ADIM 1: OTO KIRPMA (Google Lens Efekti)
-    # Resmi analiz etmeden önce gereksiz halıyı/masayı kes at.
-    aranan_resim = akilli_nesne_bul(orijinal_resim)
+    # Resmi Optimize Et (1000px)
+    h, w = resim.shape[:2]
+    if w > 1000:
+        s = 1000/w
+        resim = cv2.resize(resim, (1000, int(h*s)))
 
-    # ... (Buradan sonrası V12 ile aynı: AKAZE + OCR) ...
-    # AKAZE KISMI
-    try:
-        # Boyutlandırma
-        h, w = aranan_resim.shape[:2]
-        if w > 1000:
-            s = 1000/w
-            aranan_resim = cv2.resize(aranan_resim, (1000, int(h*s)))
-
-        img_gray = cv2.cvtColor(aranan_resim, cv2.COLOR_BGR2GRAY)
-        akaze = cv2.AKAZE_create(threshold=0.001)
-        kp1, des1 = akaze.detectAndCompute(img_gray, None)
+    # 1. GÖRSEL PUANLARI AL (AKAZE)
+    gorsel_skorlar = gorsel_puan_hesapla(resim, KLASOR)
+    
+    # 2. YAZI PUANLARI AL (OCR)
+    yazi_skorlar, okunanlar = yazi_puan_hesapla(resim, veritabani_json)
+    
+    # 3. HİBRİT PUANLAMA (BÜYÜK FİNAL)
+    # Formül: (Görsel Puan) + (Yazı Puanı x 20)
+    # Neden 20? Çünkü 1 kelime (örn: Burgu) görseldeki 20 noktaya bedeldir.
+    
+    final_skorlar = []
+    
+    # Tüm ürün kodlarını topla
+    tum_kodlar = set(list(gorsel_skorlar.keys()) + list(yazi_skorlar.keys()))
+    
+    for kod in tum_kodlar:
+        g_puan = gorsel_skorlar.get(kod, 0)
+        y_puan = yazi_skorlar.get(kod, 0)
         
-        en_iyi_skor = 0
-        en_iyi_kod = "Bulunamadı"
-
-        if des1 is not None and os.path.exists(KLASOR):
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            for dosya in os.listdir(KLASOR):
-                if not dosya.endswith((".jpg", ".png")): continue
-                try:
-                    temel_kod = dosya.split("_")[0].split(".")[0]
-                    db_path = os.path.join(KLASOR, dosya)
-                    db_img = cv2.imread(db_path, cv2.IMREAD_GRAYSCALE)
-                    if db_img is None: continue
-                    h, w = db_img.shape[:2]
-                    if w > 800:
-                        s = 800/w
-                        db_img = cv2.resize(db_img, (800, int(h*s)))
-                    kp2, des2 = akaze.detectAndCompute(db_img, None)
-                    if des2 is not None and len(des2) > 10:
-                        matches = bf.match(des1, des2)
-                        iyi = [m for m in matches if m.distance < 60]
-                        if len(iyi) >= 12:
-                            if len(iyi) > en_iyi_skor:
-                                en_iyi_skor = len(iyi)
-                                en_iyi_kod = temel_kod
-                except: pass
+        # HİBRİT PUAN FORMÜLÜ
+        toplam_puan = g_puan + (y_puan * 25) 
         
-        if en_iyi_skor > 20: return en_iyi_kod, en_iyi_skor, "Görselden (Oto Kırpma)"
-    except: pass
+        final_skorlar.append({
+            "kod": kod,
+            "toplam": toplam_puan,
+            "gorsel_detay": g_puan,
+            "yazi_detay": y_puan
+        })
 
-    # OCR KISMI (Yazı Okuma)
-    print("OCR deneniyor...")
-    try:
-        sonuclar = reader.readtext(aranan_resim, detail=0)
-        ocr_kod, ocr_skor = metin_ile_bul(sonuclar, veritabani)
-        if ocr_kod: return ocr_kod, 100, "Yazıdan (OCR)"
-    except: pass
-
-    return en_iyi_kod, en_iyi_skor, "Görsel"
+    # Puanlara göre sırala
+    final_skorlar.sort(key=lambda x: x["toplam"], reverse=True)
+    
+    if not final_skorlar: return "Bulunamadı", 0, {}
+    
+    kazanan = final_skorlar[0]
+    kazanan_kod = kazanan["kod"]
+    kazanan_skor = kazanan["toplam"]
+    
+    # --- KARAR MEKANİZMASI ---
+    # Kazanması için barajı geçmeli
+    # Baraj: Ya görseli çok iyi olacak (min 15)
+    # Ya da en az 1 kelime okumuş olacak (25 puan)
+    
+    BARAJ = 25 
+    
+    if kazanan_skor >= BARAJ:
+        detay = veritabani_json.get(kazanan_kod, {"ad": kazanan_kod, "fiyat": "?"})
+        return kazanan_kod, kazanan_skor, detay
+    else:
+        return "Bulunamadı", kazanan_skor, {}
 
 @app.post("/tara")
 async def urun_tara(file: UploadFile = File(...)):
     resim_verisi = await file.read()
-    kod, skor, kaynak = goruntu_islee_ve_bul(resim_verisi)
-    detaylar = urun_bilgisi_getir(kod)
+    kod, skor, detay = analiz_et(resim_verisi)
     
-    if skor >= 15 and kod != "Bulunamadı":
-        return {"sonuc": True, "urun_kodu": kod, "guven_skoru": skor, "urun_detay": detaylar}
+    if kod != "Bulunamadı":
+        return {
+            "sonuc": True, 
+            "urun_kodu": kod, 
+            "guven_skoru": skor, 
+            "urun_detay": detay,
+            "mesaj": "Tam Eşleşme"
+        }
     else:
-        return {"sonuc": False, "mesaj": "Eşleşme Yok"}
-        
+        return {"sonuc": False, "guven_skoru": skor, "mesaj": "Eşleşme Yok"}
